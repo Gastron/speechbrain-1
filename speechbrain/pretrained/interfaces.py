@@ -19,10 +19,13 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from speechbrain.utils.data_utils import split_path
 from speechbrain.utils.distributed import run_on_main
-
 from functools import partial
+from inspect import getmembers, isfunction
+import importlib
+import os
 
-class Predictor_1st_solution(torch.nn.Module):
+
+class Predictor(torch.nn.Module):
     """Takes a trained model and makes predictions on new data.
 
     This is a base class which handles some common boilerplate.
@@ -66,7 +69,7 @@ class Predictor_1st_solution(torch.nn.Module):
     """
 
     def __init__(
-        self, modules=None, hparams=None, run_opts=None, freeze_params=True
+        self, modules=None, hparams=None, list_func_to_add=None, run_opts=None, freeze_params=True
     ):
         super().__init__()
         # Arguments passed via the run opts dictionary. Set a limited
@@ -92,6 +95,11 @@ class Predictor_1st_solution(torch.nn.Module):
                 else:
                     setattr(self, arg, default)
         
+        # Add inference function to the predictor
+        if list_func_to_add is not None:
+            for name_func, func in list_func_to_add:
+                self.add_func(name_func, func)
+
         # Make hyperparams available with dot notation too
         if hparams is not None:
             self.hparams = SimpleNamespace(**hparams)
@@ -158,7 +166,7 @@ class Predictor_1st_solution(torch.nn.Module):
         The path can be a local path, a web url, or a link to a huggingface repo.
         """
         source, fl = split_path(path)
-        path = fetch(fl, source=source, savedir=savedir)
+        #path = fetch(fl, source=source, savedir=savedir)
         signal, sr = torchaudio.load(path, channels_first=False)
         return self.audio_normalizer(signal, sr)
 
@@ -201,17 +209,19 @@ class Predictor_1st_solution(torch.nn.Module):
                         )
                     self.mods[name] = module
 
-    def add_func(self, func):
-        setattr(self, func.__name__, partial(func, self))
+    def add_func(self, name_func, func):
+        setattr(self, name_func, partial(func, self))
 
     @classmethod
-    def from_hparams(
+    def import_model(
         cls,
         source,
         hparams_file="hyperparams.yaml",
+        inference_file="inference.py",
         overrides={},
         savedir=None,
         use_auth_token=False,
+        revision="main",
         **kwargs,
     ):
         """Fetch and load based from outside source based on HyperPyYAML file
@@ -233,6 +243,9 @@ class Predictor_1st_solution(torch.nn.Module):
             The name of the hyperparameters file to use for constructing
             the modules necessary for inference. Must contain two keys:
             "modules" and "pretrainer", as described.
+        inference_file : str
+            The name of the inference file to use for wrapping the 
+            inference functions into the Predictor class.
         overrides : dict
             Any changes to make to the hparams file when it is loaded.
         savedir : str or Path
@@ -242,18 +255,33 @@ class Predictor_1st_solution(torch.nn.Module):
             If true Hugginface's auth_token will be used to load private models from the HuggingFace Hub,
             default is False because majority of models are public.
         """
+
+        # Import function from absolute path
+        def path_import(absolute_path):
+            '''implementation taken from https://docs.python.org/3/library/importlib.html#importing-a-source-file-directly'''
+            spec = importlib.util.spec_from_file_location(absolute_path, absolute_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
         if savedir is None:
             clsname = cls.__name__
             savedir = f"./pretrained_models/{clsname}-{hash(source)}"
         hparams_local_path = fetch(
-            hparams_file, source, savedir, use_auth_token
+            hparams_file, source, savedir, use_auth_token=use_auth_token,
         )
 
-        list_inference_func = []
+        inference_path = fetch(
+            inference_file, source, savedir, use_auth_token=use_auth_token,
+        )
+        # import model-based inference function from 
+        module_func = os.path.join(os.path.abspath(savedir), inference_file)
+        module_func = path_import(module_func)
+        # list of tuple (name_func, func)    
+        list_func = getmembers(module_func, isfunction)
         # Load the modules:
         with open(hparams_local_path) as fin:
             hparams = load_hyperpyyaml(fin, overrides)
-
         # Pretraining:
         pretrainer = hparams["pretrainer"]
         pretrainer.set_collect_in(savedir)
@@ -264,4 +292,4 @@ class Predictor_1st_solution(torch.nn.Module):
         pretrainer.load_collected(device="cpu")
 
         # Now return the system
-        return cls(hparams["modules"], hparams, **kwargs)
+        return cls(hparams["modules"], hparams, list_func, **kwargs)
