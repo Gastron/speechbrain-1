@@ -302,7 +302,7 @@ class Pretrained(torch.nn.Module):
                 logger.INFO(
                     "There is more then one class, please, keep only the one for prediction."
                 )
-                    sys.exit()
+                sys.exit()
             else:
                 if class_name is None:
                     print("")
